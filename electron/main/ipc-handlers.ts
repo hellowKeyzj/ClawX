@@ -21,7 +21,7 @@ import {
 } from '../utils/secure-storage';
 import { getOpenClawStatus } from '../utils/paths';
 import { getSetting } from '../utils/store';
-import { saveProviderKeyToOpenClaw } from '../utils/openclaw-auth';
+import { saveProviderKeyToOpenClaw, setOpenClawDefaultModel } from '../utils/openclaw-auth';
 
 /**
  * Register all IPC handlers
@@ -226,6 +226,13 @@ function registerProviderHandlers(): void {
         } catch (err) {
           console.warn('Failed to save key to OpenClaw auth-profiles:', err);
         }
+      }
+      
+      // Set the default model in OpenClaw config based on provider type
+      try {
+        setOpenClawDefaultModel(config.type);
+      } catch (err) {
+        console.warn('Failed to set OpenClaw default model:', err);
       }
       
       return { success: true };

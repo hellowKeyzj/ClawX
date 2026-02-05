@@ -161,3 +161,61 @@ export function buildProviderEnvVars(providers: Array<{ type: string; apiKey: st
   
   return env;
 }
+
+/**
+ * Provider type to default model mapping
+ * Used to set the gateway's default model when the user selects a provider
+ */
+const PROVIDER_DEFAULT_MODELS: Record<string, string> = {
+  anthropic: 'anthropic/claude-sonnet-4-20250514',
+  openai: 'openai/gpt-4o',
+  google: 'google/gemini-2.5-pro-preview-06-05',
+  openrouter: 'openrouter/anthropic/claude-sonnet-4',
+};
+
+/**
+ * Update the OpenClaw config to use the given provider and model
+ * Writes to ~/.openclaw/openclaw.json
+ */
+export function setOpenClawDefaultModel(provider: string): void {
+  const configPath = join(homedir(), '.openclaw', 'openclaw.json');
+  
+  let config: Record<string, unknown> = {};
+  
+  try {
+    if (existsSync(configPath)) {
+      config = JSON.parse(readFileSync(configPath, 'utf-8'));
+    }
+  } catch (err) {
+    console.warn('Failed to read openclaw.json, creating fresh config:', err);
+  }
+  
+  const model = PROVIDER_DEFAULT_MODELS[provider];
+  if (!model) {
+    console.warn(`No default model mapping for provider "${provider}"`);
+    return;
+  }
+  
+  // Set the default model for the agents
+  const agents = (config.agents || {}) as Record<string, unknown>;
+  const defaults = (agents.defaults || {}) as Record<string, unknown>;
+  defaults.model = model;
+  agents.defaults = defaults;
+  config.agents = agents;
+  
+  // Ensure gateway mode is set
+  const gateway = (config.gateway || {}) as Record<string, unknown>;
+  if (!gateway.mode) {
+    gateway.mode = 'local';
+  }
+  config.gateway = gateway;
+  
+  // Ensure directory exists
+  const dir = join(configPath, '..');
+  if (!existsSync(dir)) {
+    mkdirSync(dir, { recursive: true });
+  }
+  
+  writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf-8');
+  console.log(`Set OpenClaw default model to "${model}" for provider "${provider}"`);
+}
