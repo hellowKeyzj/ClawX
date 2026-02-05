@@ -12,7 +12,7 @@
   "scripts": {
     "dev": "vite",
     "dev:electron": "electron .",
-    "build": "tsc && vite build && electron-builder",
+    "build": "pnpm run build:vite && pnpm run package",
     "build:vite": "vite build",
     "build:electron": "tsc -p tsconfig.node.json",
     "preview": "vite preview",
@@ -23,11 +23,19 @@
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
     "test:e2e": "playwright test",
+    "icons": "bash scripts/generate-icons.sh",
+    "clean": "rm -rf dist dist-electron release",
     "package": "electron-builder",
     "package:mac": "electron-builder --mac",
+    "package:mac:universal": "electron-builder --mac --universal",
     "package:win": "electron-builder --win",
     "package:linux": "electron-builder --linux",
-    "package:all": "electron-builder -mwl"
+    "package:all": "electron-builder -mwl",
+    "publish": "electron-builder --publish always",
+    "publish:mac": "electron-builder --mac --publish always",
+    "publish:win": "electron-builder --win --publish always",
+    "publish:linux": "electron-builder --linux --publish always",
+    "release": "pnpm run build:vite && pnpm run publish"
   },
   "dependencies": {
     "electron-store": "^10.0.0",

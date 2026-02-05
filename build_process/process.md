@@ -12,6 +12,7 @@
 * [commit_4] Provider configuration - Secure API key storage, provider management UI
 * [commit_5] Channel connection flows - Multi-channel support with QR/token connection UI
 * [commit_6] Auto-update functionality - electron-updater integration with UI
+* [commit_7] Packaging and distribution - CI/CD, multi-platform builds, icon generation
 
 ### Plan:
 1. ~~Initialize project structure~~ ✅
@@ -20,7 +21,10 @@
 4. ~~Add Provider configuration (API Key management)~~ ✅
 5. ~~Implement Channel connection flows~~ ✅
 6. ~~Add auto-update functionality~~ ✅
-7. Packaging and distribution setup
+7. ~~Packaging and distribution setup~~ ✅
+8. Chat interface
+9. Skills browser/enable page
+10. Cron tasks management
 
 ## Version Milestones
 
