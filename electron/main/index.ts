@@ -8,6 +8,7 @@ import { GatewayManager } from '../gateway/manager';
 import { registerIpcHandlers } from './ipc-handlers';
 import { createTray } from './tray';
 import { createMenu } from './menu';
+import { applyProxyFromSettings } from './proxy';
 
 import { appUpdater, registerUpdateHandlers } from './updater';
 import { logger } from '../utils/logger';
@@ -119,6 +120,13 @@ async function initialize(): Promise<void> {
 
   // Create system tray
   createTray(mainWindow);
+
+  // Apply proxy settings for main process
+  try {
+    await applyProxyFromSettings();
+  } catch (error) {
+    logger.warn('Failed to apply proxy settings:', error);
+  }
 
   // Override security headers ONLY for the OpenClaw Gateway Control UI
   session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
