@@ -81,6 +81,22 @@ jobs:
           # Increase file descriptor limit to handle large number of files during code signing
           ulimit -n 65536
           echo "File descriptor limit: $(ulimit -n)"
+
+          # Guardrail: if CSC_LINK is misconfigured (e.g. points to a directory),
+          # fall back to unsigned build instead of failing hard.
+          if [ -n "${CSC_LINK:-}" ]; then
+            echo "Detected CSC_LINK in environment"
+            if [ -d "${CSC_LINK}" ]; then
+              echo "Invalid CSC_LINK: points to a directory (${CSC_LINK})"
+              echo "Falling back to unsigned build"
+              unset CSC_LINK
+              unset CSC_KEY_PASSWORD
+              export CSC_IDENTITY_AUTO_DISCOVERY=false
+            fi
+          else
+            echo "No CSC_LINK provided; building unsigned macOS artifacts"
+            export CSC_IDENTITY_AUTO_DISCOVERY=false
+          fi
           
           pnpm run package:mac
 
