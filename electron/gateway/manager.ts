@@ -4,21 +4,25 @@
  */
 import { app } from 'electron';
 import path from 'path';
-import { spawn, ChildProcess } from 'child_process';
+import { spawn, spawnSync, ChildProcess } from 'child_process';
 import { EventEmitter } from 'events';
-import { existsSync } from 'fs';
+import { existsSync, readFileSync } from 'fs';
 import WebSocket from 'ws';
 import { PORTS } from '../utils/config';
 import { 
   getOpenClawDir, 
+  getOpenClawConfigDir,
+  getDefaultOpenClawConfigDir,
+  setOpenClawConfigDirOverride,
   getOpenClawEntryPath, 
   isOpenClawBuilt, 
   isOpenClawPresent 
 } from '../utils/paths';
-import { getSetting } from '../utils/store';
+import { getSetting, setSetting } from '../utils/store';
 import { getApiKey, getDefaultProvider, getProvider } from '../utils/secure-storage';
 import { getProviderEnvVar, getKeyableProviderTypes } from '../utils/provider-registry';
 import { GatewayEventType, JsonRpcNotification, isNotification, isResponse } from './protocol';
+import { buildWindowsPortOwnerProbeScript, tryConvertPosixWslUncToWindowsPath } from './runtime-utils';
 import { logger } from '../utils/logger';
 import { getUvMirrorEnv } from '../utils/uv-env';
 import { isPythonReady, setupManagedPython } from '../utils/uv-setup';
@@ -64,6 +68,13 @@ const DEFAULT_RECONNECT_CONFIG: ReconnectConfig = {
   baseDelay: 1000,
   maxDelay: 30000,
 };
+
+const FAST_ATTACH_HANDSHAKE_TIMEOUT_MS = 1200;
+const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10000;
+const ATTACH_TOTAL_BUDGET_MS = 3000;
+const ATTACH_RETRY_INTERVAL_MS = 200;
+
+export type GatewayHostRuntime = 'linux' | 'wsl' | 'windows' | 'macos';
 
 /**
  * Get the Node.js-compatible executable path for spawning child processes.
@@ -120,10 +131,23 @@ export class GatewayManager extends EventEmitter {
     reject: (error: Error) => void;
     timeout: NodeJS.Timeout;
   }> = new Map();
+  private runtimePaths: {
+    hostRuntime: GatewayHostRuntime;
+    configDir: string;
+    workspaceDir?: string;
+    configPath?: string;
+  } = {
+      hostRuntime: process.platform === 'win32' ? 'windows' : process.platform === 'darwin' ? 'macos' : 'linux',
+      configDir: getDefaultOpenClawConfigDir(),
+    };
   
   constructor(config?: Partial<ReconnectConfig>) {
     super();
     this.reconnectConfig = { ...DEFAULT_RECONNECT_CONFIG, ...config };
+    const localRuntime = this.detectLocalRuntime();
+    this.runtimePaths.hostRuntime = localRuntime;
+    this.runtimePaths.configDir = this.getDefaultConfigDirForRuntime(localRuntime);
+    setOpenClawConfigDirOverride(this.runtimePaths.configDir);
   }
 
   private sanitizeSpawnArgs(args: string[]): string[] {
@@ -155,6 +179,641 @@ export class GatewayManager extends EventEmitter {
     if (msg.includes('Debugger attached')) return { level: 'debug', normalized: msg };
 
     return { level: 'warn', normalized: msg };
+  }
+
+  private isWslKernel(): boolean {
+    if (process.platform !== 'linux') {
+      return false;
+    }
+    if (process.env.WSL_DISTRO_NAME || process.env.WSL_INTEROP) {
+      return true;
+    }
+    try {
+      const osrelease = readFileSync('/proc/sys/kernel/osrelease', 'utf-8').toLowerCase();
+      return osrelease.includes('microsoft');
+    } catch {
+      return false;
+    }
+  }
+
+  private detectLocalRuntime(): GatewayHostRuntime {
+    if (process.platform === 'win32') return 'windows';
+    if (process.platform === 'darwin') return 'macos';
+    return this.isWslKernel() ? 'wsl' : 'linux';
+  }
+
+  private isLikelyWindowsPath(input: string): boolean {
+    return /^[a-zA-Z]:[\\/]/.test(input) || input.startsWith('\\\\');
+  }
+
+  private convertWslPathToWindows(posixPath: string): string | undefined {
+    if (process.platform !== 'win32' || !posixPath.startsWith('/')) {
+      return undefined;
+    }
+    try {
+      const converted = spawnSync('wsl.exe', ['wslpath', '-w', posixPath], {
+        encoding: 'utf-8',
+        windowsHide: true,
+        timeout: 1500,
+      });
+      if (converted.status !== 0) {
+        return undefined;
+      }
+      const out = (converted.stdout ?? '').trim();
+      return out.length > 0 ? out : undefined;
+    } catch (error) {
+      logger.debug('Failed to convert WSL path to Windows path:', error);
+      return undefined;
+    }
+  }
+
+  private getWslDefaultConfigDirFromWindows(): string | undefined {
+    if (process.platform !== 'win32') {
+      return undefined;
+    }
+    try {
+      const probe = spawnSync(
+        'wsl.exe',
+        ['sh', '-lc', 'printf %s "$HOME/.openclaw"'],
+        {
+          encoding: 'utf-8',
+          windowsHide: true,
+          timeout: 1500,
+        },
+      );
+      if (probe.status !== 0) {
+        return undefined;
+      }
+      const posixPath = (probe.stdout ?? '').trim();
+      if (!posixPath) {
+        return undefined;
+      }
+      return this.convertWslPathToWindows(posixPath);
+    } catch (error) {
+      logger.debug('Failed to resolve WSL default config dir from Windows:', error);
+      return undefined;
+    }
+  }
+
+  private getDefaultConfigDirForRuntime(hostRuntime: GatewayHostRuntime): string {
+    if (hostRuntime === 'wsl' && process.platform === 'win32') {
+      return this.getWslDefaultConfigDirFromWindows() ?? getDefaultOpenClawConfigDir();
+    }
+    return getDefaultOpenClawConfigDir();
+  }
+
+  private applyHostRuntime(hostRuntime: GatewayHostRuntime): void {
+    const nextConfigDir = this.getDefaultConfigDirForRuntime(hostRuntime);
+    this.runtimePaths = {
+      ...this.runtimePaths,
+      hostRuntime,
+      configDir: nextConfigDir,
+      configPath: undefined,
+      workspaceDir: undefined,
+    };
+    setOpenClawConfigDirOverride(nextConfigDir);
+    logger.debug(`Gateway host runtime set: ${hostRuntime}, configDir=${nextConfigDir}`);
+  }
+
+  private isPortListeningInWsl(port: number): boolean {
+    if (process.platform !== 'win32') {
+      return false;
+    }
+    try {
+      const probe = spawnSync(
+        'wsl.exe',
+        ['sh', '-lc', `ss -H -ltn 'sport = :${port}' | head -n 1`],
+        {
+          encoding: 'utf-8',
+          windowsHide: true,
+          timeout: 1200,
+        },
+      );
+      if (probe.status !== 0) {
+        return false;
+      }
+      return (probe.stdout ?? '').trim().length > 0;
+    } catch (error) {
+      logger.debug('Failed to detect WSL listening port:', error);
+      return false;
+    }
+  }
+
+  private isPortListeningInWindows(port: number): boolean {
+    if (process.platform !== 'win32') {
+      return false;
+    }
+    try {
+      const probe = spawnSync(
+        'powershell.exe',
+        ['-NoProfile', '-Command', `(Get-NetTCPConnection -State Listen -LocalPort ${port} -ErrorAction SilentlyContinue | Select-Object -First 1 | ForEach-Object { $_.LocalPort })`],
+        {
+          encoding: 'utf-8',
+          windowsHide: true,
+          timeout: 1200,
+        },
+      );
+      if (probe.status !== 0) {
+        return false;
+      }
+      return (probe.stdout ?? '').trim().length > 0;
+    } catch (error) {
+      logger.debug('Failed to detect Windows listening port:', error);
+      return false;
+    }
+  }
+
+  private async detectGatewayHostRuntimeByProcess(port: number): Promise<GatewayHostRuntime> {
+    const localRuntime = this.detectLocalRuntime();
+    if (process.platform !== 'win32') {
+      return localRuntime;
+    }
+
+    const listeningInWindows = this.isPortListeningInWindows(port);
+    const listeningInWsl = this.isPortListeningInWsl(port);
+
+    if (listeningInWindows && !listeningInWsl) {
+      return 'windows';
+    }
+    if (listeningInWsl && !listeningInWindows) {
+      return 'wsl';
+    }
+
+    const saved = await getSetting('gatewayHostRuntime');
+    if (saved === 'windows' || saved === 'wsl') {
+      return saved;
+    }
+    return localRuntime;
+  }
+
+  private isOpenClawProcessCommand(command?: string): boolean {
+    if (!command) {
+      return false;
+    }
+    const normalized = command.toLowerCase();
+    return normalized.includes('openclaw') || normalized.includes('openclaw.mjs') || normalized.includes(' gateway ');
+  }
+
+  private getWindowsPortOwner(port: number): { occupied: boolean; pid?: number; command?: string } {
+    if (process.platform !== 'win32') {
+      return { occupied: false };
+    }
+    try {
+      const script = buildWindowsPortOwnerProbeScript(port);
+      const probe = spawnSync('powershell.exe', ['-NoProfile', '-Command', script], {
+        encoding: 'utf-8',
+        windowsHide: true,
+        timeout: 1800,
+      });
+      if (probe.status !== 0) {
+        return { occupied: false };
+      }
+      const raw = (probe.stdout ?? '').trim();
+      if (!raw) {
+        return { occupied: false };
+      }
+      const parsed = JSON.parse(raw) as { occupied?: boolean; pid?: number; command?: string };
+      return {
+        occupied: Boolean(parsed.occupied),
+        pid: typeof parsed.pid === 'number' ? parsed.pid : undefined,
+        command: typeof parsed.command === 'string' ? parsed.command : undefined,
+      };
+    } catch (error) {
+      logger.debug('Failed to query Windows port owner:', error);
+      return { occupied: false };
+    }
+  }
+
+  private getWslPortOwnerFromWindows(port: number): { occupied: boolean; pid?: number; command?: string } {
+    if (process.platform !== 'win32') {
+      return { occupied: false };
+    }
+    try {
+      const script = [
+        `line=$(ss -H -ltnp "sport = :${port}" 2>/dev/null | head -n 1)`,
+        'if [ -z "$line" ]; then',
+        '  echo "0||"',
+        '  exit 0',
+        'fi',
+        "pid=$(printf '%s' \"$line\" | sed -n 's/.*pid=\\([0-9][0-9]*\\).*/\\1/p')",
+        'cmd=""',
+        'if [ -n "$pid" ]; then',
+        '  cmd=$(ps -p "$pid" -o args= 2>/dev/null | head -n 1)',
+        'fi',
+        'printf "1|%s|%s\\n" "$pid" "$cmd"',
+      ].join('; ');
+      const probe = spawnSync('wsl.exe', ['sh', '-lc', script], {
+        encoding: 'utf-8',
+        windowsHide: true,
+        timeout: 1800,
+      });
+      if (probe.status !== 0) {
+        return { occupied: false };
+      }
+      const raw = (probe.stdout ?? '').trim();
+      if (!raw) {
+        return { occupied: false };
+      }
+      const [occupiedFlag, pidRaw, ...cmdParts] = raw.split('|');
+      if (occupiedFlag !== '1') {
+        return { occupied: false };
+      }
+      const pid = Number(pidRaw);
+      return {
+        occupied: true,
+        pid: Number.isFinite(pid) ? pid : undefined,
+        command: cmdParts.join('|').trim() || undefined,
+      };
+    } catch (error) {
+      logger.debug('Failed to query WSL port owner:', error);
+      return { occupied: false };
+    }
+  }
+
+  private getLocalPortOwner(port: number): { occupied: boolean; pid?: number; command?: string } {
+    if (process.platform === 'win32') {
+      return this.getWindowsPortOwner(port);
+    }
+    try {
+      const script = [
+        `line=$(ss -H -ltnp "sport = :${port}" 2>/dev/null | head -n 1)`,
+        'if [ -z "$line" ]; then',
+        '  echo "0||"',
+        '  exit 0',
+        'fi',
+        "pid=$(printf '%s' \"$line\" | sed -n 's/.*pid=\\([0-9][0-9]*\\).*/\\1/p')",
+        'cmd=""',
+        'if [ -n "$pid" ]; then',
+        '  cmd=$(ps -p "$pid" -o args= 2>/dev/null | head -n 1)',
+        'fi',
+        'printf "1|%s|%s\\n" "$pid" "$cmd"',
+      ].join('; ');
+      const probe = spawnSync('sh', ['-lc', script], {
+        encoding: 'utf-8',
+        windowsHide: true,
+        timeout: 1800,
+      });
+      if (probe.status !== 0) {
+        return { occupied: false };
+      }
+      const raw = (probe.stdout ?? '').trim();
+      if (!raw) {
+        return { occupied: false };
+      }
+      const [occupiedFlag, pidRaw, ...cmdParts] = raw.split('|');
+      if (occupiedFlag !== '1') {
+        return { occupied: false };
+      }
+      const pid = Number(pidRaw);
+      return {
+        occupied: true,
+        pid: Number.isFinite(pid) ? pid : undefined,
+        command: cmdParts.join('|').trim() || undefined,
+      };
+    } catch (error) {
+      logger.debug('Failed to query local port owner:', error);
+      return { occupied: false };
+    }
+  }
+
+  private async detectAttachTarget(port: number): Promise<{
+    occupied: boolean;
+    hostRuntime: GatewayHostRuntime;
+    ownerKind: 'openclaw' | 'other' | 'unknown';
+    details: string;
+  }> {
+    const localRuntime = this.detectLocalRuntime();
+    if (process.platform !== 'win32') {
+      const owner = this.getLocalPortOwner(port);
+      if (!owner.occupied) {
+        return {
+          occupied: false,
+          hostRuntime: localRuntime,
+          ownerKind: 'unknown',
+          details: 'port not occupied',
+        };
+      }
+      if (owner.command && !this.isOpenClawProcessCommand(owner.command)) {
+        return {
+          occupied: true,
+          hostRuntime: localRuntime,
+          ownerKind: 'other',
+          details: `pid=${owner.pid ?? 'unknown'} cmd=${owner.command}`,
+        };
+      }
+      return {
+        occupied: true,
+        hostRuntime: localRuntime,
+        ownerKind: owner.command ? 'openclaw' : 'unknown',
+        details: `pid=${owner.pid ?? 'unknown'} cmd=${owner.command ?? 'n/a'}`,
+      };
+    }
+
+    const winOwner = this.getWindowsPortOwner(port);
+    const wslOwner = this.getWslPortOwnerFromWindows(port);
+    if (!winOwner.occupied && !wslOwner.occupied) {
+      return {
+        occupied: false,
+        hostRuntime: 'windows',
+        ownerKind: 'unknown',
+        details: 'port not occupied',
+      };
+    }
+
+    const chooseHost = async (): Promise<GatewayHostRuntime> => {
+      if (winOwner.occupied && !wslOwner.occupied) return 'windows';
+      if (wslOwner.occupied && !winOwner.occupied) return 'wsl';
+      const winLooksOpenClaw = this.isOpenClawProcessCommand(winOwner.command);
+      const wslLooksOpenClaw = this.isOpenClawProcessCommand(wslOwner.command);
+      if (winLooksOpenClaw && !wslLooksOpenClaw) return 'windows';
+      if (wslLooksOpenClaw && !winLooksOpenClaw) return 'wsl';
+      const saved = await getSetting('gatewayHostRuntime');
+      if (saved === 'windows' || saved === 'wsl') return saved;
+      return 'windows';
+    };
+    const hostRuntime = await chooseHost();
+    const owner = hostRuntime === 'wsl' ? wslOwner : winOwner;
+    if (owner.command && !this.isOpenClawProcessCommand(owner.command)) {
+      return {
+        occupied: true,
+        hostRuntime,
+        ownerKind: 'other',
+        details: `host=${hostRuntime} pid=${owner.pid ?? 'unknown'} cmd=${owner.command}`,
+      };
+    }
+    return {
+      occupied: true,
+      hostRuntime,
+      ownerKind: owner.command ? 'openclaw' : 'unknown',
+      details: `host=${hostRuntime} pid=${owner.pid ?? 'unknown'} cmd=${owner.command ?? 'n/a'}`,
+    };
+  }
+
+  private readGatewayTokenFromConfigDir(configDir: string): string | undefined {
+    try {
+      const configPath = path.join(configDir, 'openclaw.json');
+      if (!existsSync(configPath)) {
+        return undefined;
+      }
+      const raw = readFileSync(configPath, 'utf-8');
+      const parsed = JSON.parse(raw) as {
+        gateway?: { auth?: { token?: unknown } };
+      };
+      const token = parsed?.gateway?.auth?.token;
+      if (typeof token !== 'string') {
+        return undefined;
+      }
+      const trimmed = token.trim();
+      return trimmed.length > 0 ? trimmed : undefined;
+    } catch (error) {
+      logger.debug('Failed to read gateway.auth.token from openclaw.json:', error);
+      return undefined;
+    }
+  }
+
+  private readGatewayTokenFromWslConfig(): string | undefined {
+    if (process.platform !== 'win32') {
+      return undefined;
+    }
+    try {
+      const probe = spawnSync(
+        'wsl.exe',
+        ['sh', '-lc', 'cat ~/.openclaw/openclaw.json 2>/dev/null'],
+        {
+          encoding: 'utf-8',
+          windowsHide: true,
+          timeout: 1500,
+        },
+      );
+      if (probe.status !== 0) {
+        return undefined;
+      }
+      const raw = (probe.stdout ?? '').trim();
+      if (!raw) {
+        return undefined;
+      }
+      const parsed = JSON.parse(raw) as {
+        gateway?: { auth?: { token?: unknown } };
+      };
+      const token = parsed?.gateway?.auth?.token;
+      if (typeof token !== 'string') {
+        return undefined;
+      }
+      const trimmed = token.trim();
+      return trimmed.length > 0 ? trimmed : undefined;
+    } catch (error) {
+      logger.debug('Failed to read gateway.auth.token from WSL openclaw.json:', error);
+      return undefined;
+    }
+  }
+
+  private resolvePathForHost(hostRuntime: GatewayHostRuntime, input?: string): string | undefined {
+    if (!input || typeof input !== 'string') {
+      return undefined;
+    }
+    const trimmed = input.trim();
+    if (!trimmed) {
+      return undefined;
+    }
+    if (hostRuntime === 'wsl' && process.platform === 'win32') {
+      if (this.isLikelyWindowsPath(trimmed)) {
+        return trimmed;
+      }
+      const uncPath = tryConvertPosixWslUncToWindowsPath(trimmed);
+      if (uncPath) {
+        return uncPath;
+      }
+      return this.convertWslPathToWindows(trimmed) ?? trimmed;
+    }
+    return trimmed;
+  }
+
+  private inferHostRuntimeFromGatewayPaths(
+    fallback: GatewayHostRuntime,
+    configPathRaw?: string,
+    workspaceRaw?: string,
+    sessionsPathRaw?: string,
+  ): GatewayHostRuntime {
+    if (process.platform !== 'win32') {
+      return fallback;
+    }
+    const hasPosixStylePath = [configPathRaw, workspaceRaw, sessionsPathRaw]
+      .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+      .some((value) => value.startsWith('/'));
+    if (hasPosixStylePath) {
+      return 'wsl';
+    }
+    if (this.isLikelyWindowsPath(configPathRaw ?? '') || this.isLikelyWindowsPath(workspaceRaw ?? '') || this.isLikelyWindowsPath(sessionsPathRaw ?? '')) {
+      return 'windows';
+    }
+    return fallback;
+  }
+
+  private async refreshRuntimePathsFromGateway(): Promise<void> {
+    if (!this.isConnected()) {
+      return;
+    }
+
+    let configPathRaw: string | undefined;
+    let workspaceRaw: string | undefined;
+    let sessionsPathRaw: string | undefined;
+
+    try {
+      const snapshot = await this.rpc<{
+        path?: string;
+        config?: { agents?: { defaults?: { workspace?: string } } };
+      }>('config.get', undefined, 5000);
+      configPathRaw = snapshot?.path;
+      workspaceRaw = snapshot?.config?.agents?.defaults?.workspace;
+    } catch (error) {
+      logger.debug('Failed to fetch config.get for runtime path detection:', error);
+    }
+
+    try {
+      const status = await this.rpc<{
+        sessions?: { paths?: string[]; path?: string };
+      }>('status', undefined, 5000);
+      sessionsPathRaw = status?.sessions?.paths?.[0] ?? status?.sessions?.path;
+    } catch (error) {
+      logger.debug('Failed to fetch status for runtime path detection:', error);
+    }
+
+    const detectedHostRuntime = this.inferHostRuntimeFromGatewayPaths(
+      this.runtimePaths.hostRuntime,
+      configPathRaw,
+      workspaceRaw,
+      sessionsPathRaw,
+    );
+    const hostConfigPath = this.resolvePathForHost(detectedHostRuntime, configPathRaw);
+    const hostWorkspace = this.resolvePathForHost(detectedHostRuntime, workspaceRaw);
+    const hostSessionsPath = this.resolvePathForHost(detectedHostRuntime, sessionsPathRaw);
+    const inferredConfigDir = (() => {
+      if (hostConfigPath) {
+        return path.dirname(hostConfigPath);
+      }
+      if (!hostSessionsPath) {
+        return undefined;
+      }
+      const normalized = hostSessionsPath.replace(/\\/g, '/');
+      const marker = '/agents/';
+      const idx = normalized.indexOf(marker);
+      if (idx === -1) {
+        return undefined;
+      }
+      const prefix = normalized.slice(0, idx);
+      return this.resolvePathForHost(detectedHostRuntime, prefix) ?? prefix;
+    })();
+
+    const resolvedConfigDir = inferredConfigDir ?? this.getDefaultConfigDirForRuntime(detectedHostRuntime);
+
+    this.runtimePaths = {
+      hostRuntime: detectedHostRuntime,
+      configDir: resolvedConfigDir,
+      workspaceDir: hostWorkspace,
+      configPath: hostConfigPath,
+    };
+    setOpenClawConfigDirOverride(resolvedConfigDir);
+
+    logger.debug(`Gateway runtime paths detected: hostRuntime=${this.runtimePaths.hostRuntime}, configDir=${this.runtimePaths.configDir}, workspaceDir=${this.runtimePaths.workspaceDir ?? 'n/a'}`);
+    await setSetting('gatewayHostRuntime', detectedHostRuntime);
+  }
+
+  getRuntimePaths(): {
+    hostRuntime: GatewayHostRuntime;
+    configDir: string;
+    workspaceDir?: string;
+    configPath?: string;
+  } {
+    return { ...this.runtimePaths };
+  }
+
+  private async getGatewayTokenCandidates(hostRuntime: GatewayHostRuntime): Promise<string[]> {
+    const candidates: string[] = [];
+    if (hostRuntime === 'wsl' && process.platform === 'win32') {
+      const wslToken = this.readGatewayTokenFromWslConfig();
+      if (wslToken) {
+        candidates.push(wslToken);
+      }
+    } else {
+      const configDirCandidates = Array.from(
+        new Set(
+          [this.runtimePaths.configDir, getOpenClawConfigDir(), getDefaultOpenClawConfigDir()]
+            .filter((dir): dir is string => typeof dir === 'string' && dir.trim().length > 0),
+        ),
+      );
+      for (const configDir of configDirCandidates) {
+        const configToken = this.readGatewayTokenFromConfigDir(configDir);
+        if (configToken) {
+          candidates.push(configToken);
+        }
+      }
+    }
+
+    const settingsToken = await getSetting('gatewayToken');
+    if (settingsToken && typeof settingsToken === 'string') {
+      const trimmed = settingsToken.trim();
+      if (trimmed.length > 0) {
+        candidates.push(trimmed);
+      }
+    }
+
+    return Array.from(new Set(candidates));
+  }
+
+  private async connectWithTokenDiscovery(
+    port: number,
+    hostRuntime: GatewayHostRuntime,
+    handshakeTimeoutMs = FAST_ATTACH_HANDSHAKE_TIMEOUT_MS,
+  ): Promise<void> {
+    const candidates = await this.getGatewayTokenCandidates(hostRuntime);
+    let lastError: Error | null = null;
+
+    if (candidates.length === 0) {
+      throw new Error('No gateway token available for authentication');
+    }
+
+    for (const token of candidates) {
+      try {
+        await this.connect(port, {
+          token,
+          handshakeTimeoutMs,
+        });
+
+        const currentToken = await getSetting('gatewayToken');
+        if (currentToken !== token) {
+          await setSetting('gatewayToken', token);
+          logger.debug('Synchronized ClawX gatewayToken with successful token source');
+        }
+        await setSetting('gatewayHostRuntime', hostRuntime);
+        return;
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error(String(error));
+      }
+    }
+
+    throw lastError ?? new Error('Gateway authentication failed');
+  }
+
+  private async attachWithBudget(port: number, hostRuntime: GatewayHostRuntime): Promise<void> {
+    const startedAt = Date.now();
+    let lastError: Error | null = null;
+    while (Date.now() - startedAt < ATTACH_TOTAL_BUDGET_MS) {
+      const elapsed = Date.now() - startedAt;
+      const remaining = ATTACH_TOTAL_BUDGET_MS - elapsed;
+      const handshakeTimeoutMs = Math.min(FAST_ATTACH_HANDSHAKE_TIMEOUT_MS, Math.max(350, remaining - 50));
+      try {
+        await this.connectWithTokenDiscovery(port, hostRuntime, handshakeTimeoutMs);
+        return;
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error(String(error));
+      }
+      const nowElapsed = Date.now() - startedAt;
+      if (nowElapsed >= ATTACH_TOTAL_BUDGET_MS) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, ATTACH_RETRY_INTERVAL_MS));
+    }
+    throw lastError ?? new Error(`Failed to attach Gateway within ${ATTACH_TOTAL_BUDGET_MS}ms`);
   }
   
   /**
@@ -201,39 +860,46 @@ export class GatewayManager extends EventEmitter {
     this.setStatus({ state: 'starting', reconnectAttempts: 0 });
     
     try {
-      // Check if Python environment is ready (self-healing)
-      const pythonReady = await isPythonReady();
-      if (!pythonReady) {
-        logger.info('Python environment missing or incomplete, attempting background repair...');
-        // We don't await this to avoid blocking Gateway startup, 
-        // as uv run will handle it if needed, but this pre-warms it.
-        void setupManagedPython().catch(err => {
-          logger.error('Background Python repair failed:', err);
-        });
-      }
+      const attachTarget = await this.detectAttachTarget(this.status.port);
+      this.applyHostRuntime(attachTarget.hostRuntime);
+      logger.debug(`Gateway attach target: occupied=${attachTarget.occupied}, ownerKind=${attachTarget.ownerKind}, details=${attachTarget.details}`);
 
-      // Check if Gateway is already running
-      logger.debug('Checking for existing Gateway...');
-      const existing = await this.findExistingGateway();
-      if (existing) {
-        logger.debug(`Found existing Gateway on port ${existing.port}`);
-        await this.connect(existing.port);
+      // Port is already occupied: attach only, never spawn.
+      if (attachTarget.occupied) {
+        if (attachTarget.ownerKind === 'other') {
+          throw new Error(`Port ${this.status.port} is occupied by non-OpenClaw process (${attachTarget.details})`);
+        }
+        await this.attachWithBudget(this.status.port, attachTarget.hostRuntime);
         this.ownsProcess = false;
         this.setStatus({ pid: undefined });
         this.startHealthCheck();
         return;
       }
+
+      // Only perform runtime self-healing when we actually need to spawn.
+      const pythonReady = await isPythonReady();
+      if (!pythonReady) {
+        logger.info('Python environment missing or incomplete, attempting background repair...');
+        void setupManagedPython().catch(err => {
+          logger.error('Background Python repair failed:', err);
+        });
+      }
       
       logger.debug('No existing Gateway found, starting new process...');
+      const spawnHostRuntime = this.detectLocalRuntime();
+      this.applyHostRuntime(spawnHostRuntime);
       
       // Start new Gateway process
       await this.startProcess();
       
       // Wait for Gateway to be ready
       await this.waitForReady();
+
+      const readyHostRuntime = await this.detectGatewayHostRuntimeByProcess(this.status.port);
+      this.applyHostRuntime(readyHostRuntime);
       
       // Connect WebSocket
-      await this.connect(this.status.port);
+      await this.connectWithTokenDiscovery(this.status.port, readyHostRuntime, DEFAULT_HANDSHAKE_TIMEOUT_MS);
       
       // Start health monitoring
       this.startHealthCheck();
@@ -254,8 +920,9 @@ export class GatewayManager extends EventEmitter {
   /**
    * Stop Gateway process
    */
-  async stop(): Promise<void> {
+  async stop(options?: { shutdownExternal?: boolean }): Promise<void> {
     logger.info('Gateway stop requested');
+    const shutdownExternal = options?.shutdownExternal ?? false;
     // Disable auto-reconnect
     this.shouldReconnect = false;
     
@@ -264,12 +931,14 @@ export class GatewayManager extends EventEmitter {
     
     // If this manager is attached to an external gateway process, ask it to shut down
     // over protocol before closing the socket.
-    if (!this.ownsProcess && this.ws?.readyState === WebSocket.OPEN) {
+    if (shutdownExternal && !this.ownsProcess && this.ws?.readyState === WebSocket.OPEN) {
       try {
         await this.rpc('shutdown', undefined, 5000);
       } catch (error) {
         logger.warn('Failed to request shutdown for externally managed Gateway:', error);
       }
+    } else if (!this.ownsProcess) {
+      logger.debug('Skipping external Gateway shutdown; disconnecting ClawX only');
     }
 
     // Close WebSocket
@@ -424,38 +1093,6 @@ export class GatewayManager extends EventEmitter {
   }
   
   /**
-   * Find existing Gateway process by attempting a WebSocket connection
-   */
-  private async findExistingGateway(): Promise<{ port: number } | null> {
-    try {
-      const port = PORTS.OPENCLAW_GATEWAY;
-      // Try a quick WebSocket connection to check if gateway is listening
-      return await new Promise<{ port: number } | null>((resolve) => {
-        const testWs = new WebSocket(`ws://localhost:${port}/ws`);
-        const timeout = setTimeout(() => {
-          testWs.close();
-          resolve(null);
-        }, 2000);
-        
-        testWs.on('open', () => {
-          clearTimeout(timeout);
-          testWs.close();
-          resolve({ port });
-        });
-        
-        testWs.on('error', () => {
-          clearTimeout(timeout);
-          resolve(null);
-        });
-      });
-    } catch {
-      // Gateway not running
-    }
-    
-    return null;
-  }
-  
-  /**
    * Start Gateway process
    * Uses OpenClaw npm package from node_modules (dev) or resources (production)
    */
@@ -471,7 +1108,11 @@ export class GatewayManager extends EventEmitter {
     }
     
     // Get or generate gateway token
-    const gatewayToken = await getSetting('gatewayToken');
+    const tokenCandidates = await this.getGatewayTokenCandidates(this.runtimePaths.hostRuntime);
+    const gatewayToken = tokenCandidates[0];
+    if (!gatewayToken) {
+      throw new Error('Missing gateway token. Configure gateway.auth.token or ClawX gatewayToken first.');
+    }
     
     let command: string;
     let args: string[];
@@ -740,9 +1381,15 @@ export class GatewayManager extends EventEmitter {
   /**
    * Connect WebSocket to Gateway
    */
-  private async connect(port: number): Promise<void> {
-    // Get token for WebSocket authentication
-    const gatewayToken = await getSetting('gatewayToken');
+  private async connect(
+    port: number,
+    opts?: { token?: string; handshakeTimeoutMs?: number }
+  ): Promise<void> {
+    const gatewayToken = opts?.token;
+    if (!gatewayToken) {
+      throw new Error('Missing gateway token for connection');
+    }
+    const handshakeTimeoutMs = opts?.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS;
     logger.debug(`Connecting Gateway WebSocket (ws://localhost:${port}/ws)`);
     
     return new Promise((resolve, reject) => {
@@ -822,21 +1469,24 @@ export class GatewayManager extends EventEmitter {
             this.ws?.close();
             rejectOnce(new Error('Connect handshake timeout'));
           }
-        }, 10000);
+        }, handshakeTimeoutMs);
         handshakeTimeout = requestTimeout;
         
         this.pendingRequests.set(connectId, {
           resolve: (_result) => {
             handshakeComplete = true;
             logger.debug('Gateway connect handshake completed');
-            this.setStatus({
-              state: 'running',
-              port,
-              connectedAt: Date.now(),
-            });
-            this.startPing();
-            resolveOnce();
-          },
+          this.setStatus({
+            state: 'running',
+            port,
+            connectedAt: Date.now(),
+          });
+          void this.refreshRuntimePathsFromGateway().catch((err) =>
+            logger.debug('Runtime path refresh failed after connect:', err),
+          );
+          this.startPing();
+          resolveOnce();
+        },
           reject: (error) => {
             logger.error('Gateway connect handshake failed:', error);
             rejectOnce(error);
@@ -1043,10 +1693,13 @@ export class GatewayManager extends EventEmitter {
     this.reconnectTimer = setTimeout(async () => {
       this.reconnectTimer = null;
       try {
-        // Try to find existing Gateway first
-        const existing = await this.findExistingGateway();
-        if (existing) {
-          await this.connect(existing.port);
+        const attachTarget = await this.detectAttachTarget(this.status.port);
+        this.applyHostRuntime(attachTarget.hostRuntime);
+        if (attachTarget.occupied) {
+          if (attachTarget.ownerKind === 'other') {
+            throw new Error(`Port ${this.status.port} is occupied by non-OpenClaw process (${attachTarget.details})`);
+          }
+          await this.attachWithBudget(this.status.port, attachTarget.hostRuntime);
           this.ownsProcess = false;
           this.setStatus({ pid: undefined });
           this.reconnectAttempts = 0;
@@ -1055,9 +1708,13 @@ export class GatewayManager extends EventEmitter {
         }
         
         // Otherwise restart the process
+        const spawnHostRuntime = this.detectLocalRuntime();
+        this.applyHostRuntime(spawnHostRuntime);
         await this.startProcess();
         await this.waitForReady();
-        await this.connect(this.status.port);
+        const readyHostRuntime = await this.detectGatewayHostRuntimeByProcess(this.status.port);
+        this.applyHostRuntime(readyHostRuntime);
+        await this.connectWithTokenDiscovery(this.status.port, readyHostRuntime, DEFAULT_HANDSHAKE_TIMEOUT_MS);
         this.reconnectAttempts = 0;
         this.startHealthCheck();
       } catch (error) {

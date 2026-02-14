@@ -8,6 +8,12 @@ import { homedir } from 'os';
 import { existsSync, mkdirSync, readFileSync, realpathSync } from 'fs';
 import { logger } from './logger';
 
+let runtimeOpenClawConfigDirOverride: string | null = null;
+
+export function getDefaultOpenClawConfigDir(): string {
+  return join(homedir(), '.openclaw');
+}
+
 /**
  * Expand ~ to home directory
  */
@@ -22,7 +28,22 @@ export function expandPath(path: string): string {
  * Get OpenClaw config directory
  */
 export function getOpenClawConfigDir(): string {
-  return join(homedir(), '.openclaw');
+  if (runtimeOpenClawConfigDirOverride) {
+    return runtimeOpenClawConfigDirOverride;
+  }
+  return getDefaultOpenClawConfigDir();
+}
+
+export function setOpenClawConfigDirOverride(dir: string): void {
+  const trimmed = dir.trim();
+  if (!trimmed) {
+    return;
+  }
+  runtimeOpenClawConfigDirOverride = trimmed;
+}
+
+export function clearOpenClawConfigDirOverride(): void {
+  runtimeOpenClawConfigDirOverride = null;
 }
 
 /**

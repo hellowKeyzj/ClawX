@@ -3,11 +3,13 @@
  * Direct read/write access to skill configuration in ~/.openclaw/openclaw.json
  * This bypasses the Gateway RPC for faster and more reliable config updates
  */
-import { readFileSync, writeFileSync, existsSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { join } from 'path';
-import { homedir } from 'os';
+import { getOpenClawConfigDir } from './paths';
 
-const OPENCLAW_CONFIG_PATH = join(homedir(), '.openclaw', 'openclaw.json');
+function getOpenClawConfigPath(): string {
+    return join(getOpenClawConfigDir(), 'openclaw.json');
+}
 
 interface SkillEntry {
     enabled?: boolean;
@@ -27,11 +29,12 @@ interface OpenClawConfig {
  * Read the current OpenClaw config
  */
 function readConfig(): OpenClawConfig {
-    if (!existsSync(OPENCLAW_CONFIG_PATH)) {
+    const configPath = getOpenClawConfigPath();
+    if (!existsSync(configPath)) {
         return {};
     }
     try {
-        const raw = readFileSync(OPENCLAW_CONFIG_PATH, 'utf-8');
+        const raw = readFileSync(configPath, 'utf-8');
         return JSON.parse(raw);
     } catch (err) {
         console.error('Failed to read openclaw config:', err);
@@ -43,8 +46,13 @@ function readConfig(): OpenClawConfig {
  * Write the OpenClaw config
  */
 function writeConfig(config: OpenClawConfig): void {
+    const configPath = getOpenClawConfigPath();
+    const configDir = join(configPath, '..');
+    if (!existsSync(configDir)) {
+        mkdirSync(configDir, { recursive: true });
+    }
     const json = JSON.stringify(config, null, 2);
-    writeFileSync(OPENCLAW_CONFIG_PATH, json, 'utf-8');
+    writeFileSync(configPath, json, 'utf-8');
 }
 
 /**

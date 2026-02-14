@@ -65,7 +65,21 @@
         "appLogs": "应用日志",
         "openFolder": "打开文件夹",
         "autoStart": "自动启动网关",
-        "autoStartDesc": "ClawX 启动时自动启动网关"
+        "autoStartDesc": "ClawX 启动时自动启动网关",
+        "proxy": {
+            "title": "网关代理",
+            "description": "仅将代理设置应用到网关子进程",
+            "http": "HTTP 代理",
+            "https": "HTTPS 代理",
+            "allSocks": "全局代理 (SOCKS)",
+            "apply": "应用",
+            "reload": "重载",
+            "toast": {
+                "savedRestarting": "代理已保存，正在重启网关...",
+                "savedStartToApply": "代理已保存，启动网关后生效。",
+                "saveFailed": "保存代理失败：{{error}}"
+            }
+        }
     },
     "updates": {
         "title": "更新",

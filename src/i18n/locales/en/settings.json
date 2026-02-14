@@ -65,7 +65,21 @@
         "appLogs": "Application Logs",
         "openFolder": "Open Folder",
         "autoStart": "Auto-start Gateway",
-        "autoStartDesc": "Start Gateway when ClawX launches"
+        "autoStartDesc": "Start Gateway when ClawX launches",
+        "proxy": {
+            "title": "Gateway Proxy",
+            "description": "Apply proxy settings to the Gateway subprocess only",
+            "http": "HTTP Proxy",
+            "https": "HTTPS Proxy",
+            "allSocks": "ALL Proxy (SOCKS)",
+            "apply": "Apply",
+            "reload": "Reload",
+            "toast": {
+                "savedRestarting": "Proxy saved. Restarting Gateway...",
+                "savedStartToApply": "Proxy saved. Start Gateway to apply.",
+                "saveFailed": "Failed to save proxy: {{error}}"
+            }
+        }
     },
     "updates": {
         "title": "Updates",

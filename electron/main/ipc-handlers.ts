@@ -4,7 +4,6 @@
  */
 import { ipcMain, BrowserWindow, shell, dialog, app, nativeImage } from 'electron';
 import { existsSync, copyFileSync, statSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { join, extname, basename } from 'node:path';
 import crypto from 'node:crypto';
 import { GatewayManager } from '../gateway/manager';
@@ -22,7 +21,7 @@ import {
   getAllProvidersWithKeyInfo,
   type ProviderConfig,
 } from '../utils/secure-storage';
-import { getOpenClawStatus, getOpenClawDir, getOpenClawConfigDir, getOpenClawSkillsDir, ensureDir } from '../utils/paths';
+import { getOpenClawStatus, getOpenClawDir, getOpenClawConfigDir, ensureDir } from '../utils/paths';
 import { getOpenClawCliCommand, installOpenClawCliMac } from '../utils/openclaw-cli';
 import { getAllSettings, getSetting, resetSettings, setSetting } from '../utils/store';
 import {
@@ -63,7 +62,7 @@ export function registerIpcHandlers(
   registerClawHubHandlers(clawHubService);
 
   // OpenClaw handlers
-  registerOpenClawHandlers();
+  registerOpenClawHandlers(gatewayManager);
 
   // Provider handlers
   registerProviderHandlers();
@@ -583,7 +582,7 @@ function registerGatewayHandlers(
  * OpenClaw-related IPC handlers
  * For checking package status and channel configuration
  */
-function registerOpenClawHandlers(): void {
+function registerOpenClawHandlers(gatewayManager: GatewayManager): void {
 
   // Get OpenClaw package status
   ipcMain.handle('openclaw:status', () => {
@@ -605,14 +604,29 @@ function registerOpenClawHandlers(): void {
 
   // Get the OpenClaw config directory (~/.openclaw)
   ipcMain.handle('openclaw:getConfigDir', () => {
-    return getOpenClawConfigDir();
+    return gatewayManager.getRuntimePaths().configDir;
   });
 
   // Get the OpenClaw skills directory (~/.openclaw/skills)
   ipcMain.handle('openclaw:getSkillsDir', () => {
-    const dir = getOpenClawSkillsDir();
-    ensureDir(dir);
+    const configDir = gatewayManager.getRuntimePaths().configDir || getOpenClawConfigDir();
+    const dir = join(configDir, 'skills');
+    try {
+      ensureDir(dir);
+    } catch (error) {
+      logger.debug('Failed to ensure OpenClaw skills dir, returning detected path anyway:', error);
+    }
     return dir;
+  });
+
+  // Get the OpenClaw workspace directory (if discoverable from connected Gateway)
+  ipcMain.handle('openclaw:getWorkspaceDir', () => {
+    return gatewayManager.getRuntimePaths().workspaceDir ?? null;
+  });
+
+  // Get detected runtime info (hostRuntime/config/workspace) for diagnostics and UI display
+  ipcMain.handle('openclaw:getRuntimeInfo', () => {
+    return gatewayManager.getRuntimePaths();
   });
 
   // Get a shell command to run OpenClaw CLI without modifying PATH
@@ -1526,7 +1540,9 @@ function mimeToExt(mimeType: string): string {
   return '';
 }
 
-const OUTBOUND_DIR = join(homedir(), '.openclaw', 'media', 'outbound');
+function getOutboundDir(): string {
+  return join(getOpenClawConfigDir(), 'media', 'outbound');
+}
 
 /**
  * Generate a small preview data URL for image files.
@@ -1557,13 +1573,14 @@ function generateImagePreview(filePath: string, mimeType: string): string | null
 function registerFileHandlers(): void {
   // Stage files from real disk paths (used with dialog:open)
   ipcMain.handle('file:stage', async (_, filePaths: string[]) => {
-    mkdirSync(OUTBOUND_DIR, { recursive: true });
+    const outboundDir = getOutboundDir();
+    mkdirSync(outboundDir, { recursive: true });
 
     const results = [];
     for (const filePath of filePaths) {
       const id = crypto.randomUUID();
       const ext = extname(filePath);
-      const stagedPath = join(OUTBOUND_DIR, `${id}${ext}`);
+      const stagedPath = join(outboundDir, `${id}${ext}`);
       copyFileSync(filePath, stagedPath);
 
       const stat = statSync(stagedPath);
@@ -1587,11 +1604,12 @@ function registerFileHandlers(): void {
     fileName: string;
     mimeType: string;
   }) => {
-    mkdirSync(OUTBOUND_DIR, { recursive: true });
+    const outboundDir = getOutboundDir();
+    mkdirSync(outboundDir, { recursive: true });
 
     const id = crypto.randomUUID();
     const ext = extname(payload.fileName) || mimeToExt(payload.mimeType);
-    const stagedPath = join(OUTBOUND_DIR, `${id}${ext}`);
+    const stagedPath = join(outboundDir, `${id}${ext}`);
     const buffer = Buffer.from(payload.base64, 'base64');
     writeFileSync(stagedPath, buffer);
 

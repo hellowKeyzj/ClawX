@@ -65,7 +65,21 @@
         "appLogs": "アプリケーションログ",
         "openFolder": "フォルダーを開く",
         "autoStart": "ゲートウェイ自動起動",
-        "autoStartDesc": "ClawX 起動時にゲートウェイを自動起動"
+        "autoStartDesc": "ClawX 起動時にゲートウェイを自動起動",
+        "proxy": {
+            "title": "ゲートウェイプロキシ",
+            "description": "プロキシ設定はゲートウェイのサブプロセスにのみ適用されます",
+            "http": "HTTP プロキシ",
+            "https": "HTTPS プロキシ",
+            "allSocks": "全体プロキシ (SOCKS)",
+            "apply": "適用",
+            "reload": "再読み込み",
+            "toast": {
+                "savedRestarting": "プロキシを保存しました。ゲートウェイを再起動しています...",
+                "savedStartToApply": "プロキシを保存しました。適用するにはゲートウェイを起動してください。",
+                "saveFailed": "プロキシの保存に失敗しました: {{error}}"
+            }
+        }
     },
     "updates": {
         "title": "アップデート",

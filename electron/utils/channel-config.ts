@@ -4,12 +4,8 @@
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, statSync, rmSync } from 'fs';
 import { join } from 'path';
-import { homedir } from 'os';
-import { getOpenClawResolvedDir } from './paths';
+import { getOpenClawResolvedDir, getOpenClawConfigDir } from './paths';
 import * as logger from './logger';
-
-const OPENCLAW_DIR = join(homedir(), '.openclaw');
-const CONFIG_FILE = join(OPENCLAW_DIR, 'openclaw.json');
 
 // Channels that are managed as plugins (config goes under plugins.entries, not channels)
 const PLUGIN_CHANNELS = ['whatsapp'];
@@ -30,12 +26,21 @@ export interface OpenClawConfig {
     [key: string]: unknown;
 }
 
+function getConfigPaths(): { openclawDir: string; configFile: string } {
+    const openclawDir = getOpenClawConfigDir();
+    return {
+        openclawDir,
+        configFile: join(openclawDir, 'openclaw.json'),
+    };
+}
+
 /**
  * Ensure OpenClaw config directory exists
  */
 function ensureConfigDir(): void {
-    if (!existsSync(OPENCLAW_DIR)) {
-        mkdirSync(OPENCLAW_DIR, { recursive: true });
+    const { openclawDir } = getConfigPaths();
+    if (!existsSync(openclawDir)) {
+        mkdirSync(openclawDir, { recursive: true });
     }
 }
 
@@ -44,13 +49,14 @@ function ensureConfigDir(): void {
  */
 export function readOpenClawConfig(): OpenClawConfig {
     ensureConfigDir();
+    const { configFile } = getConfigPaths();
 
-    if (!existsSync(CONFIG_FILE)) {
+    if (!existsSync(configFile)) {
         return {};
     }
 
     try {
-        const content = readFileSync(CONFIG_FILE, 'utf-8');
+        const content = readFileSync(configFile, 'utf-8');
         return JSON.parse(content) as OpenClawConfig;
     } catch (error) {
         logger.error('Failed to read OpenClaw config', error);
@@ -64,9 +70,10 @@ export function readOpenClawConfig(): OpenClawConfig {
  */
 export function writeOpenClawConfig(config: OpenClawConfig): void {
     ensureConfigDir();
+    const { configFile } = getConfigPaths();
 
     try {
-        writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2), 'utf-8');
+        writeFileSync(configFile, JSON.stringify(config, null, 2), 'utf-8');
     } catch (error) {
         logger.error('Failed to write OpenClaw config', error);
         console.error('Failed to write OpenClaw config:', error);
@@ -98,9 +105,10 @@ export function saveChannelConfig(
             enabled: config.enabled ?? true,
         };
         writeOpenClawConfig(currentConfig);
+        const { configFile } = getConfigPaths();
         logger.info('Plugin channel config saved', {
             channelType,
-            configFile: CONFIG_FILE,
+            configFile,
             path: `plugins.entries.${channelType}`,
         });
         console.log(`Saved plugin channel config for ${channelType}`);
@@ -180,9 +188,10 @@ export function saveChannelConfig(
     };
 
     writeOpenClawConfig(currentConfig);
+    const { configFile } = getConfigPaths();
     logger.info('Channel config saved', {
         channelType,
-        configFile: CONFIG_FILE,
+        configFile,
         rawKeys: Object.keys(config),
         transformedKeys: Object.keys(transformedConfig),
         enabled: currentConfig.channels[channelType]?.enabled,
@@ -292,8 +301,7 @@ export function deleteChannelConfig(channelType: string): void {
     // Special handling for WhatsApp credentials
     if (channelType === 'whatsapp') {
         try {
-
-            const whatsappDir = join(homedir(), '.openclaw', 'credentials', 'whatsapp');
+            const whatsappDir = join(getOpenClawConfigDir(), 'credentials', 'whatsapp');
             if (existsSync(whatsappDir)) {
                 rmSync(whatsappDir, { recursive: true, force: true });
                 console.log('Deleted WhatsApp credentials directory');
@@ -319,7 +327,7 @@ export function listConfiguredChannels(): string[] {
 
     // Check for WhatsApp credentials directory
     try {
-        const whatsappDir = join(homedir(), '.openclaw', 'credentials', 'whatsapp');
+        const whatsappDir = join(getOpenClawConfigDir(), 'credentials', 'whatsapp');
         if (existsSync(whatsappDir)) {
             const entries = readdirSync(whatsappDir);
             // Check if there's at least one directory (session)

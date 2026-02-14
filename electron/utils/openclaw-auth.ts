@@ -5,12 +5,12 @@
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
-import { homedir } from 'os';
 import {
   getProviderEnvVar,
   getProviderDefaultModel,
   getProviderConfig,
 } from './provider-registry';
+import { getOpenClawConfigDir } from './paths';
 
 const AUTH_STORE_VERSION = 1;
 const AUTH_PROFILE_FILENAME = 'auth-profiles.json';
@@ -38,7 +38,11 @@ interface AuthProfilesStore {
  * Get the path to the auth-profiles.json for a given agent
  */
 function getAuthProfilesPath(agentId = 'main'): string {
-  return join(homedir(), '.openclaw', 'agents', agentId, 'agent', AUTH_PROFILE_FILENAME);
+  return join(getOpenClawConfigDir(), 'agents', agentId, 'agent', AUTH_PROFILE_FILENAME);
+}
+
+function getOpenClawConfigPath(): string {
+  return join(getOpenClawConfigDir(), 'openclaw.json');
 }
 
 /**
@@ -181,7 +185,7 @@ export function buildProviderEnvVars(providers: Array<{ type: string; apiKey: st
  *   For siliconflow this is the user-supplied model ID prefixed with "siliconflow/".
  */
 export function setOpenClawDefaultModel(provider: string, modelOverride?: string): void {
-  const configPath = join(homedir(), '.openclaw', 'openclaw.json');
+  const configPath = getOpenClawConfigPath();
   
   let config: Record<string, unknown> = {};
   
@@ -287,7 +291,7 @@ export function setOpenClawDefaultModelWithOverride(
   modelOverride: string | undefined,
   override: RuntimeProviderConfigOverride
 ): void {
-  const configPath = join(homedir(), '.openclaw', 'openclaw.json');
+  const configPath = getOpenClawConfigPath();
 
   let config: Record<string, unknown> = {};
   try {
