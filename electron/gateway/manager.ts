@@ -22,7 +22,11 @@ import { getSetting, setSetting } from '../utils/store';
 import { getApiKey, getDefaultProvider, getProvider } from '../utils/secure-storage';
 import { getProviderEnvVar, getKeyableProviderTypes } from '../utils/provider-registry';
 import { GatewayEventType, JsonRpcNotification, isNotification, isResponse } from './protocol';
-import { buildWindowsPortOwnerProbeScript, tryConvertPosixWslUncToWindowsPath } from './runtime-utils';
+import {
+  buildWindowsPortOwnerProbeScript,
+  isLikelyWslPortProxyCommand,
+  tryConvertPosixWslUncToWindowsPath,
+} from './runtime-utils';
 import { logger } from '../utils/logger';
 import { getUvMirrorEnv } from '../utils/uv-env';
 import { isPythonReady, setupManagedPython } from '../utils/uv-setup';
@@ -179,6 +183,43 @@ export class GatewayManager extends EventEmitter {
     if (msg.includes('Debugger attached')) return { level: 'debug', normalized: msg };
 
     return { level: 'warn', normalized: msg };
+  }
+
+  private truncateForLog(input: string, maxLen = 220): string {
+    const normalized = input.replace(/\s+/g, ' ').trim();
+    if (!normalized) {
+      return 'n/a';
+    }
+    if (normalized.length <= maxLen) {
+      return normalized;
+    }
+    return `${normalized.slice(0, maxLen)}...`;
+  }
+
+  private formatProbeDiagnostics(
+    probe: {
+      status: number | null;
+      signal: NodeJS.Signals | null;
+      error?: Error;
+      stdout?: string | Buffer | null;
+      stderr?: string | Buffer | null;
+    },
+    elapsedMs: number,
+  ): string {
+    const stdoutRaw = (() => {
+      if (probe.stdout == null) return '';
+      return typeof probe.stdout === 'string' ? probe.stdout : probe.stdout.toString('utf-8');
+    })();
+    const stderrRaw = (() => {
+      if (probe.stderr == null) return '';
+      return typeof probe.stderr === 'string' ? probe.stderr : probe.stderr.toString('utf-8');
+    })();
+    const errorCode =
+      probe.error && typeof (probe.error as NodeJS.ErrnoException).code === 'string'
+        ? (probe.error as NodeJS.ErrnoException).code
+        : 'n/a';
+    const errorMsg = probe.error ? this.truncateForLog(probe.error.message, 180) : 'n/a';
+    return `elapsedMs=${elapsedMs}, status=${probe.status ?? 'null'}, signal=${probe.signal ?? 'null'}, errorCode=${errorCode}, errorMsg=${errorMsg}, stdout="${this.truncateForLog(stdoutRaw)}", stderr="${this.truncateForLog(stderrRaw)}"`;
   }
 
   private isWslKernel(): boolean {
@@ -360,24 +401,36 @@ export class GatewayManager extends EventEmitter {
     }
     try {
       const script = buildWindowsPortOwnerProbeScript(port);
+      const startedAt = Date.now();
       const probe = spawnSync('powershell.exe', ['-NoProfile', '-Command', script], {
         encoding: 'utf-8',
         windowsHide: true,
         timeout: 1800,
       });
+      const elapsedMs = Date.now() - startedAt;
       if (probe.status !== 0) {
+        logger.debug(`Windows port owner probe failed (port=${port}): ${this.formatProbeDiagnostics(probe, elapsedMs)}`);
         return { occupied: false };
       }
       const raw = (probe.stdout ?? '').trim();
       if (!raw) {
+        logger.debug(`Windows port owner probe returned empty output (port=${port}): ${this.formatProbeDiagnostics(probe, elapsedMs)}`);
         return { occupied: false };
       }
-      const parsed = JSON.parse(raw) as { occupied?: boolean; pid?: number; command?: string };
-      return {
-        occupied: Boolean(parsed.occupied),
-        pid: typeof parsed.pid === 'number' ? parsed.pid : undefined,
-        command: typeof parsed.command === 'string' ? parsed.command : undefined,
-      };
+      try {
+        const parsed = JSON.parse(raw) as { occupied?: boolean; pid?: number; command?: string };
+        return {
+          occupied: Boolean(parsed.occupied),
+          pid: typeof parsed.pid === 'number' ? parsed.pid : undefined,
+          command: typeof parsed.command === 'string' ? parsed.command : undefined,
+        };
+      } catch (error) {
+        logger.debug(
+          `Windows port owner probe returned non-JSON output (port=${port}): ${this.formatProbeDiagnostics(probe, elapsedMs)}`,
+          error,
+        );
+        return { occupied: false };
+      }
     } catch (error) {
       logger.debug('Failed to query Windows port owner:', error);
       return { occupied: false };
@@ -402,20 +455,27 @@ export class GatewayManager extends EventEmitter {
         'fi',
         'printf "1|%s|%s\\n" "$pid" "$cmd"',
       ].join('; ');
+      const startedAt = Date.now();
       const probe = spawnSync('wsl.exe', ['sh', '-lc', script], {
         encoding: 'utf-8',
         windowsHide: true,
         timeout: 1800,
       });
+      const elapsedMs = Date.now() - startedAt;
       if (probe.status !== 0) {
+        logger.debug(`WSL port owner probe failed (port=${port}): ${this.formatProbeDiagnostics(probe, elapsedMs)}`);
         return { occupied: false };
       }
       const raw = (probe.stdout ?? '').trim();
       if (!raw) {
+        logger.debug(`WSL port owner probe returned empty output (port=${port}): ${this.formatProbeDiagnostics(probe, elapsedMs)}`);
         return { occupied: false };
       }
       const [occupiedFlag, pidRaw, ...cmdParts] = raw.split('|');
       if (occupiedFlag !== '1') {
+        logger.debug(
+          `WSL port owner probe reported not-occupied flag (port=${port}, occupiedFlag=${occupiedFlag}): ${this.formatProbeDiagnostics(probe, elapsedMs)}`,
+        );
         return { occupied: false };
       }
       const pid = Number(pidRaw);
@@ -511,7 +571,13 @@ export class GatewayManager extends EventEmitter {
 
     const winOwner = this.getWindowsPortOwner(port);
     const wslOwner = this.getWslPortOwnerFromWindows(port);
+    logger.debug(
+      `Attach target probe summary (port=${port}): win={occupied=${winOwner.occupied}, pid=${winOwner.pid ?? 'n/a'}, cmd="${this.truncateForLog(winOwner.command ?? '')}"}, wsl={occupied=${wslOwner.occupied}, pid=${wslOwner.pid ?? 'n/a'}, cmd="${this.truncateForLog(wslOwner.command ?? '')}"}`,
+    );
     if (!winOwner.occupied && !wslOwner.occupied) {
+      logger.debug(
+        `Attach target resolved as not occupied (port=${port}); this may indicate a transient probe miss when external gateway is expected.`,
+      );
       return {
         occupied: false,
         hostRuntime: 'windows',
@@ -521,6 +587,10 @@ export class GatewayManager extends EventEmitter {
     }
 
     const chooseHost = async (): Promise<GatewayHostRuntime> => {
+      if (winOwner.occupied && !wslOwner.occupied && isLikelyWslPortProxyCommand(winOwner.command)) {
+        logger.debug(`Attach target host decision: prefer wsl due to Windows WSL proxy signature (port=${port})`);
+        return 'wsl';
+      }
       if (winOwner.occupied && !wslOwner.occupied) return 'windows';
       if (wslOwner.occupied && !winOwner.occupied) return 'wsl';
       const winLooksOpenClaw = this.isOpenClawProcessCommand(winOwner.command);
@@ -532,7 +602,20 @@ export class GatewayManager extends EventEmitter {
       return 'windows';
     };
     const hostRuntime = await chooseHost();
-    const owner = hostRuntime === 'wsl' ? wslOwner : winOwner;
+    const usingWslProxyFallback =
+      hostRuntime === 'wsl' &&
+      !wslOwner.occupied &&
+      winOwner.occupied &&
+      isLikelyWslPortProxyCommand(winOwner.command);
+    const owner = hostRuntime === 'wsl' && wslOwner.occupied ? wslOwner : winOwner;
+    if (usingWslProxyFallback) {
+      return {
+        occupied: true,
+        hostRuntime,
+        ownerKind: 'unknown',
+        details: `host=${hostRuntime} proxyPid=${winOwner.pid ?? 'unknown'} cmd=${winOwner.command ?? 'n/a'}`,
+      };
+    }
     if (owner.command && !this.isOpenClawProcessCommand(owner.command)) {
       return {
         occupied: true,
