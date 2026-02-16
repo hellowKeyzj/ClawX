@@ -28,6 +28,12 @@ import {
   isLikelyWslPortProxyCommand,
   tryConvertPosixWslUncToWindowsPath,
 } from './runtime-utils';
+import {
+  buildGatewayDeviceAuthPayload,
+  loadOrCreateGatewayDeviceIdentity,
+  publicKeyRawBase64UrlFromPem,
+  signGatewayDevicePayload,
+} from './device-identity';
 import { logger } from '../utils/logger';
 import { getUvMirrorEnv } from '../utils/uv-env';
 import { isPythonReady, setupManagedPython } from '../utils/uv-setup';
@@ -80,6 +86,8 @@ const ATTACH_TOTAL_BUDGET_MS = 3000;
 const ATTACH_RETRY_INTERVAL_MS = 200;
 const FAST_ATTACH_TOTAL_BUDGET_MS = 1200;
 const PORT_OWNER_PROBE_TIMEOUT_MS = 3500;
+const CONNECT_CHALLENGE_WAIT_MS = 150;
+const OPERATOR_CONNECT_SCOPES = ['operator.read', 'operator.write', 'operator.admin'] as const;
 
 export type GatewayHostRuntime = 'linux' | 'wsl' | 'windows' | 'macos';
 
@@ -1530,12 +1538,36 @@ export class GatewayManager extends EventEmitter {
       let handshakeComplete = false;
       let connectId: string | null = null;
       let handshakeTimeout: NodeJS.Timeout | null = null;
+      let connectDelayTimer: NodeJS.Timeout | null = null;
+      let connectHandshakeSent = false;
+      let connectChallengeNonce: string | null = null;
       let settled = false;
+      const connectRole = 'operator';
+      const connectScopes = [...OPERATOR_CONNECT_SCOPES];
+      const connectClient = {
+        id: 'gateway-client',
+        displayName: 'ClawX',
+        version: '0.1.0',
+        platform: process.platform,
+        mode: 'ui',
+      } as const;
+      const deviceIdentity = (() => {
+        try {
+          return loadOrCreateGatewayDeviceIdentity(this.runtimePaths.configDir);
+        } catch (error) {
+          logger.warn('Failed to load gateway device identity, fallback to token-only connect:', error);
+          return null;
+        }
+      })();
 
       const cleanupHandshakeRequest = () => {
         if (handshakeTimeout) {
           clearTimeout(handshakeTimeout);
           handshakeTimeout = null;
+        }
+        if (connectDelayTimer) {
+          clearTimeout(connectDelayTimer);
+          connectDelayTimer = null;
         }
         if (connectId && this.pendingRequests.has(connectId)) {
           const request = this.pendingRequests.get(connectId);
@@ -1560,12 +1592,42 @@ export class GatewayManager extends EventEmitter {
         const err = error instanceof Error ? error : new Error(String(error));
         reject(err);
       };
-      
-      this.ws.on('open', async () => {
-        logger.debug('Gateway WebSocket opened, sending connect handshake');
-        
-        // Send proper connect handshake as required by OpenClaw Gateway protocol
-        // The Gateway expects: { type: "req", id: "...", method: "connect", params: ConnectParams }
+
+      const sendConnectHandshake = () => {
+        if (connectHandshakeSent) {
+          return;
+        }
+        connectHandshakeSent = true;
+        if (connectDelayTimer) {
+          clearTimeout(connectDelayTimer);
+          connectDelayTimer = null;
+        }
+
+        const signedAtMs = Date.now();
+        const device = (() => {
+          if (!deviceIdentity) {
+            return undefined;
+          }
+          const payload = buildGatewayDeviceAuthPayload({
+            deviceId: deviceIdentity.deviceId,
+            clientId: connectClient.id,
+            clientMode: connectClient.mode,
+            role: connectRole,
+            scopes: connectScopes,
+            signedAtMs,
+            token: gatewayToken,
+            nonce: connectChallengeNonce,
+          });
+          const signature = signGatewayDevicePayload(deviceIdentity.privateKeyPem, payload);
+          return {
+            id: deviceIdentity.deviceId,
+            publicKey: publicKeyRawBase64UrlFromPem(deviceIdentity.publicKeyPem),
+            signature,
+            signedAt: signedAtMs,
+            nonce: connectChallengeNonce ?? undefined,
+          };
+        })();
+
         connectId = `connect-${Date.now()}`;
         const connectFrame = {
           type: 'req',
@@ -1574,25 +1636,23 @@ export class GatewayManager extends EventEmitter {
           params: {
             minProtocol: 3,
             maxProtocol: 3,
-            client: {
-              id: 'gateway-client',
-              displayName: 'ClawX',
-              version: '0.1.0',
-              platform: process.platform,
-              mode: 'ui',
-            },
+            client: connectClient,
             auth: {
               token: gatewayToken,
             },
             caps: [],
-            role: 'operator',
-            scopes: [],
+            role: connectRole,
+            scopes: connectScopes,
+            device,
           },
         };
-        
+
+        logger.debug(
+          `Gateway connect request summary: role=${connectFrame.params.role}, scopes=${connectFrame.params.scopes.join(',')}, clientId=${connectFrame.params.client.id}, device=${device ? 'present' : 'none'}, nonce=${connectChallengeNonce ? 'present' : 'none'}`,
+        );
+
         this.ws?.send(JSON.stringify(connectFrame));
-        
-        // Store pending connect request
+
         const requestTimeout = setTimeout(() => {
           if (!handshakeComplete) {
             logger.error('Gateway connect handshake timed out');
@@ -1601,33 +1661,78 @@ export class GatewayManager extends EventEmitter {
           }
         }, handshakeTimeoutMs);
         handshakeTimeout = requestTimeout;
-        
+
         this.pendingRequests.set(connectId, {
-          resolve: (_result) => {
+          resolve: (result) => {
             handshakeComplete = true;
+            const payload =
+              typeof result === 'object' && result !== null
+                ? (result as Record<string, unknown>)
+                : undefined;
+            const server =
+              payload && typeof payload.server === 'object' && payload.server !== null
+                ? (payload.server as Record<string, unknown>)
+                : undefined;
+            const auth =
+              payload && typeof payload.auth === 'object' && payload.auth !== null
+                ? (payload.auth as Record<string, unknown>)
+                : undefined;
+            const authScopes = Array.isArray(auth?.scopes)
+              ? auth.scopes.filter((item): item is string => typeof item === 'string')
+              : [];
+
+            logger.debug(
+              `Gateway connect response summary: protocol=${String(payload?.protocol ?? 'n/a')}, serverVersion=${String(server?.version ?? 'n/a')}, authScopes=${authScopes.length > 0 ? authScopes.join(',') : 'n/a'}`,
+            );
             logger.debug('Gateway connect handshake completed');
-          this.setStatus({
-            state: 'running',
-            port,
-            connectedAt: Date.now(),
-          });
-          void this.refreshRuntimePathsFromGateway().catch((err) =>
-            logger.debug('Runtime path refresh failed after connect:', err),
-          );
-          this.startPing();
-          resolveOnce();
-        },
+            this.setStatus({
+              state: 'running',
+              port,
+              connectedAt: Date.now(),
+            });
+            void this.refreshRuntimePathsFromGateway().catch((err) =>
+              logger.debug('Runtime path refresh failed after connect:', err),
+            );
+            this.startPing();
+            resolveOnce();
+          },
           reject: (error) => {
             logger.error('Gateway connect handshake failed:', error);
             rejectOnce(error);
           },
           timeout: requestTimeout,
         });
+      };
+
+      this.ws.on('open', async () => {
+        logger.debug('Gateway WebSocket opened, waiting briefly for connect.challenge');
+        connectDelayTimer = setTimeout(() => {
+          sendConnectHandshake();
+        }, CONNECT_CHALLENGE_WAIT_MS);
       });
       
       this.ws.on('message', (data) => {
         try {
           const message = JSON.parse(data.toString());
+          if (
+            !connectHandshakeSent &&
+            typeof message === 'object' &&
+            message !== null &&
+            (message as { type?: unknown }).type === 'event' &&
+            (message as { event?: unknown }).event === 'connect.challenge'
+          ) {
+            const payload =
+              (message as { payload?: unknown }).payload &&
+              typeof (message as { payload?: unknown }).payload === 'object'
+                ? ((message as { payload?: unknown }).payload as Record<string, unknown>)
+                : undefined;
+            const nonce = typeof payload?.nonce === 'string' ? payload.nonce : null;
+            if (nonce) {
+              connectChallengeNonce = nonce;
+              logger.debug('Gateway connect.challenge received; sending signed connect request with nonce');
+              sendConnectHandshake();
+            }
+          }
           this.handleMessage(message);
         } catch (error) {
           logger.debug('Failed to parse Gateway WebSocket message:', error);
